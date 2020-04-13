@@ -113,6 +113,7 @@ where
         let global_clock = map.clock.load(atomic::Ordering::SeqCst);
         map.local.with(|state| state.local_clock.set(global_clock));
 
+        // check clock
         let new_clock = global_val.new_clock.load(atomic::Ordering::SeqCst);
         if new_clock > 0 && global_clock >= new_clock {
             if let Some(new_val) = global_val.new_value.get() {
@@ -147,7 +148,7 @@ where
         Some(MutGuard { value })
     }
 
-    pub fn remove(&mut self, key: M::Key) -> Option<T> {
+    pub fn remove(&mut self, key: M::Key) -> Option<Arc<T>> {
         let MapRef { map, remove, .. } = self;
 
         let global_lock_val = map.storage.get(&key)?;
@@ -160,7 +161,7 @@ where
             map.local.with(|state| state.local_clock.set(global_clock));
             global_val.new_clock.store(global_clock, atomic::Ordering::SeqCst);
 
-            T::clone(&global_val.value)
+            global_val.value.clone()
         };
 
         remove.push((global_lock_val, key));
@@ -185,20 +186,22 @@ where
             new_clock
         });
 
+        // pre commit
         for (lock, val) in writers.iter().zip(values.0.drain(..)) {
             let global_val = lock.inner.read();
             global_val.new_value.set(Some(Arc::new(val)));
             global_val.new_clock.store(new_clock, atomic::Ordering::SeqCst);
         }
-
         for (lock, _) in remove.iter() {
             let global_val = lock.inner.read();
             global_val.new_value.set(None);
             global_val.new_clock.store(new_clock, atomic::Ordering::SeqCst);
         }
 
-        map.clock.store(new_clock, atomic::Ordering::SeqCst);
+        // update global clock
+        map.clock.fetch_add(1, atomic::Ordering::SeqCst);
 
+        // commit (wait for readers)
         for lock in writers.iter() {
             let mut global_val = lock.inner.write();
             if let Some(val) = global_val.new_value.take() {
@@ -206,16 +209,15 @@ where
             }
             global_val.new_clock.store(0, atomic::Ordering::SeqCst);
         }
-
         for (lock, key) in remove.iter() {
             let _global_val = lock.inner.write();
             map.storage.remove(&key);
         }
 
+        // unlock
         for lock in writers.drain(..) {
             lock.write_lock.unlock();
         }
-
         for (lock, _) in remove.drain(..) {
             lock.write_lock.unlock();
         }
@@ -238,11 +240,11 @@ impl<T> Deref for MutGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.value
+        self.value
     }
 }
 
-impl<T: Clone> DerefMut for MutGuard<'_, T> {
+impl<T> DerefMut for MutGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.value
     }
